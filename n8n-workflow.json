@@ -1,0 +1,517 @@
+{
+  "name": "AI Voice Receptionist - Production Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "inbound-call",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Inbound Call Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "inbound-call-webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Initialize conversation state\nconst callSid = $input.item.json.CallSid;\nconst callerPhone = $input.item.json.From;\n\nreturn {\n  json: {\n    callSid,\n    callerPhone,\n    conversationHistory: [],\n    collectedData: {\n      name: null,\n      phone: callerPhone,\n      email: null,\n      reason: null,\n      appointmentDate: null,\n      appointmentTime: null\n    },\n    currentStep: 'greeting',\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "init-session",
+      "name": "Initialize Session",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "content": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Connect><Stream url=\"wss://{{$env.N8N_WEBHOOK_URL}}/stream/{{$json.callSid}}\" /></Connect></Response>",
+        "options": {
+          "contentType": "text/xml"
+        }
+      },
+      "id": "twiml-response",
+      "name": "TwiML Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.deepgram.com/v1/listen?model=nova-2&language=en-US&punctuate=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Token {{$env.DEEPGRAM_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "audio",
+              "value": "={{$json.audioData}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "speech-to-text",
+      "name": "Speech-to-Text (Deepgram)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract transcript and add to conversation history\nconst transcript = $input.item.json.results?.channels[0]?.alternatives[0]?.transcript;\nconst sessionData = $node['Initialize Session'].json;\n\nsessionData.conversationHistory.push({\n  role: 'user',\n  content: transcript,\n  timestamp: new Date().toISOString()\n});\n\nreturn {\n  json: {\n    ...sessionData,\n    latestTranscript: transcript\n  }\n};"
+      },
+      "id": "update-history",
+      "name": "Update Conversation History",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4-turbo-preview",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "={{$env.AI_SYSTEM_PROMPT}}"
+            },
+            {
+              "role": "user",
+              "content": "=Conversation so far: {{JSON.stringify($json.conversationHistory)}}\n\nCurrent step: {{$json.currentStep}}\n\nCollected data: {{JSON.stringify($json.collectedData)}}\n\nLatest caller message: {{$json.latestTranscript}}\n\nRespond naturally and extract any new information. Return JSON with: {response: string, extractedData: object, nextStep: string}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 300
+        }
+      },
+      "id": "ai-reasoning",
+      "name": "AI Reasoning (GPT-4)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credential",
+          "name": "OpenAI Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse AI response and update session data\nconst aiResponse = JSON.parse($input.item.json.choices[0].message.content);\nconst sessionData = $node['Update Conversation History'].json;\n\n// Update collected data with newly extracted info\nObject.assign(sessionData.collectedData, aiResponse.extractedData || {});\n\n// Add AI response to history\nsessionData.conversationHistory.push({\n  role: 'assistant',\n  content: aiResponse.response,\n  timestamp: new Date().toISOString()\n});\n\n// Update current step\nsessionData.currentStep = aiResponse.nextStep || sessionData.currentStep;\n\nreturn {\n  json: {\n    ...sessionData,\n    aiResponse: aiResponse.response\n  }\n};"
+      },
+      "id": "parse-ai-response",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.elevenlabs.io/v1/text-to-speech/{{$env.ELEVENLABS_VOICE_ID}}/stream",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "xi-api-key",
+              "value": "={{$env.ELEVENLABS_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\"text\": \"{{$json.aiResponse}}\", \"model_id\": \"eleven_turbo_v2\", \"voice_settings\": {\"stability\": 0.5, \"similarity_boost\": 0.75}}",
+        "options": {}
+      },
+      "id": "text-to-speech",
+      "name": "Text-to-Speech (ElevenLabs)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.currentStep}}",
+              "operation": "equals",
+              "value2": "booking_ready"
+            }
+          ]
+        }
+      },
+      "id": "check-booking-ready",
+      "name": "Check if Ready to Book",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1850, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "calendar",
+        "operation": "availability",
+        "calendar": {
+          "__rl": true,
+          "value": "={{$env.GOOGLE_CALENDAR_ID}}",
+          "mode": "id"
+        },
+        "timeMin": "={{$json.collectedData.appointmentDate}}T00:00:00",
+        "timeMax": "={{$json.collectedData.appointmentDate}}T23:59:59",
+        "options": {}
+      },
+      "id": "check-availability",
+      "name": "Check Calendar Availability",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [2050, 200],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "google-calendar-credential",
+          "name": "Google Calendar Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Check if requested time slot is available\nconst requestedTime = $node['Parse AI Response'].json.collectedData.appointmentTime;\nconst requestedDate = $node['Parse AI Response'].json.collectedData.appointmentDate;\nconst busyTimes = $input.item.json.busy || [];\n\nconst requestedDateTime = new Date(`${requestedDate}T${requestedTime}`);\nconst requestedEndTime = new Date(requestedDateTime.getTime() + 60 * 60 * 1000); // 1 hour appointment\n\nlet isAvailable = true;\nfor (const busy of busyTimes) {\n  const busyStart = new Date(busy.start);\n  const busyEnd = new Date(busy.end);\n  \n  if ((requestedDateTime >= busyStart && requestedDateTime < busyEnd) ||\n      (requestedEndTime > busyStart && requestedEndTime <= busyEnd)) {\n    isAvailable = false;\n    break;\n  }\n}\n\nreturn {\n  json: {\n    isAvailable,\n    requestedDateTime: requestedDateTime.toISOString(),\n    requestedEndTime: requestedEndTime.toISOString()\n  }\n};"
+      },
+      "id": "validate-availability",
+      "name": "Validate Availability",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2250, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.isAvailable}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "check-if-available",
+      "name": "Is Time Available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2450, 200]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "event",
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "={{$env.GOOGLE_CALENDAR_ID}}",
+          "mode": "id"
+        },
+        "start": "={{$node['Validate Availability'].json.requestedDateTime}}",
+        "end": "={{$node['Validate Availability'].json.requestedEndTime}}",
+        "summary": "=Appointment - {{$node['Parse AI Response'].json.collectedData.name}}",
+        "description": "=Reason: {{$node['Parse AI Response'].json.collectedData.reason}}\nPhone: {{$node['Parse AI Response'].json.collectedData.phone}}\nEmail: {{$node['Parse AI Response'].json.collectedData.email}}",
+        "options": {
+          "sendUpdates": "all"
+        },
+        "additionalFields": {
+          "attendeesUi": {
+            "attendeeValues": [
+              {
+                "email": "={{$node['Parse AI Response'].json.collectedData.email}}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "create-calendar-event",
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [2650, 100],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "google-calendar-credential",
+          "name": "Google Calendar Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{$env.GOOGLE_SHEET_ID}}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Name": "={{$node['Parse AI Response'].json.collectedData.name}}",
+            "Phone": "={{$node['Parse AI Response'].json.collectedData.phone}}",
+            "Email": "={{$node['Parse AI Response'].json.collectedData.email}}",
+            "Reason": "={{$node['Parse AI Response'].json.collectedData.reason}}",
+            "Appointment Date": "={{$node['Parse AI Response'].json.collectedData.appointmentDate}}",
+            "Appointment Time": "={{$node['Parse AI Response'].json.collectedData.appointmentTime}}",
+            "Timestamp": "={{new Date().toISOString()}}",
+            "Status": "Confirmed"
+          }
+        },
+        "options": {}
+      },
+      "id": "append-to-sheet",
+      "name": "Append to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2650, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "google-sheets-credential",
+          "name": "Google Sheets Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "callSid",
+              "field2": "callSid"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "merge-results",
+      "name": "Merge Calendar & Sheet Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [2850, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Final confirmation message\nconst data = $input.item.json;\n\nreturn {\n  json: {\n    message: 'Appointment booked successfully',\n    callSid: data.callSid,\n    appointment: {\n      name: data.name,\n      date: data.appointmentDate,\n      time: data.appointmentTime,\n      calendarEventId: data.calendarEventId,\n      sheetRow: data.sheetRow\n    },\n    finalResponse: `Perfect! You're all set for ${data.appointmentDate} at ${data.appointmentTime}. You'll receive a confirmation email at ${data.email}. Is there anything else I can help with today?`\n  }\n};"
+      },
+      "id": "booking-confirmation",
+      "name": "Generate Booking Confirmation",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [3050, 200]
+    },
+    {
+      "parameters": {
+        "errorMessage": "=Call processing error for {{$json.callSid}}: {{$json.error}}"
+      },
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [1850, 500]
+    }
+  ],
+  "connections": {
+    "Inbound Call Webhook": {
+      "main": [
+        [
+          {
+            "node": "Initialize Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize Session": {
+      "main": [
+        [
+          {
+            "node": "TwiML Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Speech-to-Text (Deepgram)": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Conversation History": {
+      "main": [
+        [
+          {
+            "node": "AI Reasoning (GPT-4)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Reasoning (GPT-4)": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          {
+            "node": "Text-to-Speech (ElevenLabs)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text-to-Speech (ElevenLabs)": {
+      "main": [
+        [
+          {
+            "node": "Check if Ready to Book",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if Ready to Book": {
+      "main": [
+        [
+          {
+            "node": "Check Calendar Availability",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Speech-to-Text (Deepgram)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Calendar Availability": {
+      "main": [
+        [
+          {
+            "node": "Validate Availability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Availability": {
+      "main": [
+        [
+          {
+            "node": "Is Time Available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Time Available?": {
+      "main": [
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Append to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Merge Calendar & Sheet Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Merge Calendar & Sheet Results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Calendar & Sheet Results": {
+      "main": [
+        [
+          {
+            "node": "Generate Booking Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2026-01-17T00:00:00.000Z",
+  "versionId": "1"
+}
